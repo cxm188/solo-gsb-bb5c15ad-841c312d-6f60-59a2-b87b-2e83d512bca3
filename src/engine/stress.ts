@@ -24,14 +24,14 @@ import type {
 } from '../types'
 
 /**
- * 录入数据指纹：只纳入与硬约束相关的有效字段（标题/需求/标签/冲突；姓名/容量）。
+ * 录入数据指纹：只纳入与硬约束相关的有效字段（标题/需求/标签/预指派/冲突；姓名/容量）。
  * 压力测试报告保存运行时指纹，App 用它与当前指纹比对以立即标记“结果已过期”。
  * 可传入已算好的硬约束评估以复用归一化结果（避免每次按键重复跑最大流）。
  */
 export function stressFingerprint(data: AppData, precomputed?: HardConstraintEvaluation): string {
   const hc = precomputed ?? evaluateHardConstraints(data)
   const papers = hc.papers
-    .map((p) => `${p.id}|${p.title}|${p.reviewsRequired}|${[...p.tags].sort().join(',')}`)
+    .map((p) => `${p.id}|${p.title}|${p.reviewsRequired}|${[...p.tags].sort().join(',')}|${[...(p.preassignedReviewerIds ?? [])].sort().join('>')}`)
     .sort()
   const reviewers = hc.reviewers
     .map(
@@ -117,6 +117,24 @@ function simulateAbsence(
     message: ''
   }
 
+  // 预指派导致的不可行（典型情形：缺席者本身被某篇稿件预指派，其容量置 0 后预占名额超限）。
+  // 此时不做 Hall 诊断（失效/违规的是具体预指派关系），直接把逐条原因带回。
+  const preassignReasons = hc.reasons.filter((r) => r.kind.startsWith('preassigned-'))
+  if (!hc.feasible && preassignReasons.length > 0 && hc.forcedKeys.length === 0) {
+    const related = preassignReasons.filter((r) => r.issue?.reviewerId === absentId)
+    return {
+      ...base,
+      feasible: false,
+      message:
+        `若 ${absent.name} 完全缺席，则无法生成可行分配：该评审人承担着 ${related.length} 条预指派硬约束，` +
+        `缺席（容量置 0）后这些预指派立即违规。\n` +
+        preassignReasons.map((r) => `  · ${r.message}`).join('\n') +
+        `\n建议：改派或移除上述稿件对该评审人的预指派。`,
+      remainingCapacity,
+      globalDeficit
+    }
+  }
+
   if (hc.feasible) {
     const activeOthers = hc.reviewers.filter((_, j) => hc.capacities[j] > 0).length
     return {
@@ -133,23 +151,29 @@ function simulateAbsence(
   // ---- 不可行：构建结构化诊断 ----
   // 统计“可选评审人”时排除所有容量为 0 的人：缺席者容量已被临时置 0，
   // 基线中容量本就为 0 的评审人同样不能承担名额
-  const activeIdx = hc.reviewers.map((_, j) => j).filter((j) => hc.capacities[j] > 0)
+  const activeIdx = hc.reviewers.map((_, j) => j).filter((j) => hc.residualCapacities[j] > 0)
+  // 残量问题中稿件 i 可走的边：无冲突且未被该稿预指派占用（同人不重复）
+  const residEligible = (i: number, j: number) => hc.eligible[i][j] && !hc.forced[i][j]
+  const forcedCountOf = (i: number) => hc.forced[i].filter(Boolean).length
 
   // 1) 单篇可分配人数不足的稿件
   const perPaperShort = new Map<number, number>()
   for (let i = 0; i < hc.papers.length; i++) {
-    const avail = activeIdx.reduce((n, j) => n + (hc.eligible[i][j] ? 1 : 0), 0)
-    if (avail < hc.demands[i]) perPaperShort.set(i, hc.demands[i] - avail)
+    const avail = activeIdx.reduce((n, j) => n + (residEligible(i, j) ? 1 : 0), 0)
+    if (hc.residualDemands[i] > 0 && avail < hc.residualDemands[i]) {
+      perPaperShort.set(i, hc.residualDemands[i] - avail)
+    }
   }
 
   // 2) 最大流残量网源侧可达稿件集合 Z（广义 Hall 缺陷集合）。
   // hc 是缺席者容量已置 0 的临时数据评估结果，直接复用其容量/冲突矩阵。
   const flow = checkFeasibility({
-    demands: hc.demands,
-    capacities: hc.capacities,
-    eligible: hc.eligible
+    demands: hc.residualDemands,
+    capacities: hc.residualCapacities,
+    eligible: hc.eligible.map((row, i) => row.map((ok, j) => ok && !hc.forced[i][j]))
   })
   const zIdx = flow.sourceReachablePapers
+    .filter((i) => hc.residualDemands[i] > 0)
     .slice()
     .sort(
       (a, b) =>
@@ -160,12 +184,12 @@ function simulateAbsence(
   // 3) Hall 见证评审人集合 Y：与 Z 中任一稿件无冲突、且容量 > 0（缺席者容量为 0，排除）
   const yIdx: number[] = []
   for (const j of activeIdx) {
-    if (zIdx.some((i) => hc.eligible[i][j])) yIdx.push(j)
+    if (zIdx.some((i) => residEligible(i, j))) yIdx.push(j)
   }
 
-  // 4) 受影响稿件：逐稿给出需求 / 剩余可选人数 / 缺口
+  // 4) 受影响稿件：逐稿给出总需求 / 剩余可选人数（已预指派者不再可选）/ 剩余名额缺口
   const affectedPapers: StressAffectedPaper[] = zIdx.map((i) => {
-    const available = activeIdx.reduce((n, j) => n + (hc.eligible[i][j] ? 1 : 0), 0)
+    const available = activeIdx.reduce((n, j) => n + (residEligible(i, j) ? 1 : 0), 0)
     return {
       paperId: hc.papers[i].id,
       required: hc.demands[i],
@@ -174,16 +198,16 @@ function simulateAbsence(
     }
   })
 
-  // 5) 名额缺口（Hall 紧见证）：demand(Z) - Σ_j∈Y min(容量_j, Z 中与 j 相连的稿件数)
-  const demandZ = zIdx.reduce((a, i) => a + hc.demands[i], 0)
+  // 5) 名额缺口（Hall 紧见证）：demand(Z) - Σ_j∈Y min(剩余容量_j, Z 中与 j 可连边的稿件数)
+  const demandZ = zIdx.reduce((a, i) => a + hc.residualDemands[i], 0)
   const bottleneckReviewers: StressBottleneckReviewer[] = yIdx
     .map((j) => {
-      const eligibleCount = zIdx.reduce((n, i) => n + (hc.eligible[i][j] ? 1 : 0), 0)
+      const eligibleCount = zIdx.reduce((n, i) => n + (residEligible(i, j) ? 1 : 0), 0)
       return {
         reviewerId: hc.reviewers[j].id,
         capacity: hc.reviewers[j].capacity,
         eligiblePaperCount: eligibleCount,
-        capacityForGroup: Math.min(hc.reviewers[j].capacity, eligibleCount)
+        capacityForGroup: Math.min(hc.residualCapacities[j], eligibleCount)
       }
     })
     .sort(
@@ -192,16 +216,19 @@ function simulateAbsence(
     )
   const capY = bottleneckReviewers.reduce((a, x) => a + x.capacityForGroup, 0)
   const deficit = Math.max(0, demandZ - capY)
+  const totalForced = hc.forced.reduce((n, row) => n + row.filter(Boolean).length, 0)
 
   // ---- 组装可读结论（不能只报总容量不足） ----
   const paperLines = affectedPapers.map((p) => {
     const paper = hc.papers.find((x) => x.id === p.paperId)!
-    const tail = p.shortfall > 0 ? `，单篇缺口 ${p.shortfall}` : '（单篇可选人数够，但整体名额调不开）'
-    return `《${paper.title}》需 ${p.required} 人，剩余可选评审人 ${p.available} 位${tail}`
+    const i = hc.papers.indexOf(paper)
+    const forcedNote = forcedCountOf(i) > 0 ? `（已预指派 ${forcedCountOf(i)} 位）` : ''
+    const tail = p.shortfall > 0 ? `，剩余名额缺口 ${p.shortfall}` : '（单篇可选人数够，但整体名额调不开）'
+    return `《${paper.title}》需 ${p.required} 人${forcedNote}，剩余可选评审人 ${p.available} 位${tail}`
   })
   const bottleneckLines = bottleneckReviewers.map((b) => {
     const name = hc.reviewers.find((x) => x.id === b.reviewerId)?.name ?? b.reviewerId
-    return `${name}（容量 ${b.capacity}，对该组可评 ${b.eligiblePaperCount} 篇，至多承担 ${b.capacityForGroup} 个名额）`
+    return `${name}（容量 ${b.capacity}，对该组还可评 ${b.eligiblePaperCount} 篇，至多再承担 ${b.capacityForGroup} 个名额）`
   })
 
   const globalLine =
@@ -211,16 +238,17 @@ function simulateAbsence(
 
   const message =
     `若 ${absent.name} 完全缺席，则无法生成可行分配。\n` +
+    (totalForced > 0 ? `当前有 ${totalForced} 条预指派作为硬约束已先行占用名额。\n` : '') +
     `${globalLine}\n` +
-    `受影响稿件共 ${affectedPapers.length} 篇、合计需求 ${demandZ} 个名额：\n` +
+    `受影响稿件共 ${affectedPapers.length} 篇、预指派之外合计需补足 ${demandZ} 个名额：\n` +
     paperLines.map((l) => `  · ${l}`).join('\n') +
     `\n可选评审人瓶颈：${
       bottleneckLines.length
-        ? `${bottleneckReviewers.length} 位可选评审人对该组稿件至多承担 ${capY} 个名额，名额缺口 ${deficit}：\n` +
+        ? `${bottleneckReviewers.length} 位可选评审人对该组稿件至多再承担 ${capY} 个名额，名额缺口 ${deficit}：\n` +
           bottleneckLines.map((l) => `  · ${l}`).join('\n')
-        : `该组稿件在剩余评审人中无任何无冲突可分配者，名额缺口 ${deficit}`
+        : `该组稿件在剩余评审人中无任何无冲突、未被预指派占用的可分配者，名额缺口 ${deficit}`
     }。\n` +
-    `建议：为上述稿件补充评审人、解除部分利益冲突，或提高相关评审人容量。`
+    `建议：为上述稿件补充评审人、解除部分利益冲突、调整预指派，或提高相关评审人容量。`
 
   return {
     ...base,

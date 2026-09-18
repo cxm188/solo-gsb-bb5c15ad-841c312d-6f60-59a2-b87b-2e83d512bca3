@@ -11,7 +11,9 @@
  *  2. 无利益冲突：A 未声明回避 q、B 未声明回避 p；
  *  3. 不重复承担同一稿件：交换前 A 未评 q（即 q ∉ A 的现有稿件）、
  *     B 未评 p（即 p ∉ B 的现有稿件）。一换一是一对一替换，每位评审人的稿件数
- *     不变，因此「每篇稿件人数不变」与「个人容量不超限」天然保持，无需额外处理。
+ *     不变，因此「每篇稿件人数不变」与「个人容量不超限」天然保持，无需额外处理；
+ *  4. 不涉及预指派硬约束：任一侧的现有分派带 preassigned 标记时排除
+ *     （预指派必须被原样兑现，互换只能在求解器自动给出的分派之间进行）。
  *
  * 候选按「主题匹配净增」从高到低排序，供界面预览后由用户确认；
  * 确认时仅在结果层改派，不触碰录入数据（AppData）。
@@ -54,6 +56,8 @@ export interface SwapExclusionCounts {
   conflict: number
   /** 交换后某评审人会重复承担同一稿件 */
   duplicate: number
+  /** 涉及预指派硬约束（预指派分派必须保持，不能被互换挪走） */
+  preassigned: number
 }
 
 export interface SwapEnumeration {
@@ -77,7 +81,7 @@ function papersOf(assignments: AssignmentItem[], reviewerId: string): Set<string
  * 要求两位评审人当前都至少承担一篇稿件，否则返回空列表。
  */
 export function enumerateSwaps(data: AppData, result: AssignmentSuccess, reviewerAId: string, reviewerBId: string): SwapEnumeration {
-  const excluded: SwapExclusionCounts = { samePaper: 0, conflict: 0, duplicate: 0 }
+  const excluded: SwapExclusionCounts = { samePaper: 0, conflict: 0, duplicate: 0, preassigned: 0 }
   if (!reviewerAId || !reviewerBId || reviewerAId === reviewerBId) {
     return { candidates: [], excluded }
   }
@@ -107,6 +111,12 @@ export function enumerateSwaps(data: AppData, result: AssignmentSuccess, reviewe
     const p = assA.paperId // A 现承担，交换后由 B 承担
     for (const assB of bPapers) {
       const q = assB.paperId // B 现承担，交换后由 A 承担
+
+      // 排除项 0：涉及预指派硬约束（任一侧分派来自预指派都不可移动）
+      if (assA.preassigned || assB.preassigned) {
+        excluded.preassigned++
+        continue
+      }
 
       // 排除项 1：同稿 → 交换后组合不变（且该稿会出现重复评审人）
       if (p === q) {
@@ -207,10 +217,13 @@ export function applySwapCandidate(
   if (!paperMap.has(sideA.fromPaperId) || !paperMap.has(sideA.toPaperId)) return null
 
   // ---- 防御性复核：候选必须建立在当前分派之上（被交换的两条确实存在） ----
-  const has = (paperId: string, reviewerId: string) =>
-    result.assignments.some((a) => a.paperId === paperId && a.reviewerId === reviewerId)
-  if (!has(sideA.fromPaperId, sideA.reviewerId)) return null
-  if (!has(sideB.fromPaperId, sideB.reviewerId)) return null
+  const existing = (paperId: string, reviewerId: string) =>
+    result.assignments.find((a) => a.paperId === paperId && a.reviewerId === reviewerId)
+  const itemA = existing(sideA.fromPaperId, sideA.reviewerId)
+  const itemB = existing(sideB.fromPaperId, sideB.reviewerId)
+  if (!itemA || !itemB) return null
+  // 预指派硬约束不得被互换挪走
+  if (itemA.preassigned || itemB.preassigned) return null
 
   // 同稿 / 组合不变
   if (sideA.fromPaperId === sideB.fromPaperId) return null
@@ -222,15 +235,15 @@ export function applySwapCandidate(
   const bPaperSet = papersOf(result.assignments, sideB.reviewerId)
   if (aPaperSet.has(sideA.toPaperId) || bPaperSet.has(sideB.toPaperId)) return null
 
-  // ---- 执行改派：替换两条分派，其余保持不变 ----
+  // ---- 执行改派：替换两条分派，其余保持不变（互换产生的新分派不携带预指派标记） ----
   const next: AssignmentItem[] = result.assignments.map((a) => {
     if (a.paperId === sideA.fromPaperId && a.reviewerId === sideA.reviewerId) {
       const tags = computeMatchedTags(paperMap.get(sideA.toPaperId)!, reviewerA)
-      return { paperId: sideA.toPaperId, reviewerId: sideA.reviewerId, topicMatched: tags.length > 0, matchedTags: tags }
+      return { paperId: sideA.toPaperId, reviewerId: sideA.reviewerId, topicMatched: tags.length > 0, matchedTags: tags, preassigned: false }
     }
     if (a.paperId === sideB.fromPaperId && a.reviewerId === sideB.reviewerId) {
       const tags = computeMatchedTags(paperMap.get(sideB.toPaperId)!, reviewerB)
-      return { paperId: sideB.toPaperId, reviewerId: sideB.reviewerId, topicMatched: tags.length > 0, matchedTags: tags }
+      return { paperId: sideB.toPaperId, reviewerId: sideB.reviewerId, topicMatched: tags.length > 0, matchedTags: tags, preassigned: false }
     }
     return a
   })
@@ -263,7 +276,9 @@ export function applySwapCandidate(
       topicMatches,
       maxLoad: Math.max(0, ...loads.map((l) => l.assigned)),
       totalAssigned: next.length,
-      totalRequired: result.objective.totalRequired
+      totalRequired: result.objective.totalRequired,
+      // 互换只移动非预指派分派，预指派条数保持不变
+      preassignedCount: next.filter((a) => a.preassigned).length
     },
     manuallyAdjusted: true,
     swapCount: (result.swapCount ?? 0) + 1

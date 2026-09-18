@@ -120,10 +120,10 @@ export function SwapTool({ data, result, onApply }: SwapToolProps) {
           <div className="swap-summary">
             共枚举到 <strong>{enumeration.candidates.length}</strong> 个可行互换候选
             {enumeration.candidates.length === 0 && '——这两位评审人的现有任务之间没有可安全互换的组合'}
-            {(enumeration.excluded.samePaper + enumeration.excluded.conflict + enumeration.excluded.duplicate > 0) && (
+            {(enumeration.excluded.samePaper + enumeration.excluded.conflict + enumeration.excluded.duplicate + enumeration.excluded.preassigned > 0) && (
               <span className="muted">
                 （已排除：同稿/组合不变 {enumeration.excluded.samePaper}，利益冲突 {enumeration.excluded.conflict}
-                ，重复承担 {enumeration.excluded.duplicate}）
+                ，重复承担 {enumeration.excluded.duplicate}，预指派锁定 {enumeration.excluded.preassigned}）
               </span>
             )}
           </div>

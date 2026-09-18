@@ -17,7 +17,13 @@ function check(name: string, cond: boolean, extra = '') {
 }
 
 const mk = (papers: AppData['papers'], reviewers: AppData['reviewers']): AppData => ({ papers, reviewers })
-const P = (id: string, title: string, reviewsRequired: number, tags: string[] = []) => ({ id: id, title, reviewsRequired, tags })
+const P = (id: string, title: string, reviewsRequired: number, tags: string[] = [], preassignedReviewerIds: string[] = []) => ({
+  id,
+  title,
+  reviewsRequired,
+  tags,
+  ...(preassignedReviewerIds.length ? { preassignedReviewerIds } : {})
+})
 const R = (id: string, name: string, capacity: number, tags: string[] = [], conflictPaperIds: string[] = []) => ({
   id, name, capacity, tags, conflictPaperIds
 })
@@ -281,7 +287,7 @@ function makeSuccess(d: AppData, pairs: Array<[string, string]>): AssignmentSucc
     const paper = d.papers.find((p) => p.id === paperId)!
     const reviewer = d.reviewers.find((r) => r.id === reviewerId)!
     const tags = computeMatchedTags(paper, reviewer)
-    return { paperId, reviewerId, topicMatched: tags.length > 0, matchedTags: tags }
+    return { paperId, reviewerId, topicMatched: tags.length > 0, matchedTags: tags, preassigned: false }
   })
   const counts = new Map<string, number>()
   for (const a of assignments) counts.set(a.reviewerId, (counts.get(a.reviewerId) ?? 0) + 1)
@@ -294,7 +300,8 @@ function makeSuccess(d: AppData, pairs: Array<[string, string]>): AssignmentSucc
       topicMatches: assignments.filter((a) => a.topicMatched).length,
       maxLoad: Math.max(0, ...loads.map((l) => l.assigned)),
       totalAssigned: assignments.length,
-      totalRequired: assignments.length
+      totalRequired: assignments.length,
+      preassignedCount: assignments.filter((a) => a.preassigned).length
     }
   }
 }
@@ -426,6 +433,192 @@ const findCandidate = (list: SwapCandidate[], a: string, fromA: string, b: strin
     sideB: { ...bogus.sideB, fromPaperId: 'p1' }
   }
   check('与当前分派不符的过期候选返回 null', applySwapCandidate(d, res, staleCand) === null)
+}
+
+/* ============================ 预指派（硬约束） ============================ */
+
+// 21. 预指派被强制兑现：b 被预指派给 p1（即便标签不匹配，求解器也必须分派）
+{
+  const d = mk(
+    [P('p1', 'A', 1, ['X'], ['b']), P('p2', 'B', 1, ['Y'])],
+    [R('a', '甲', 2, ['X']), R('b', '乙', 2, [])]
+  )
+  const res = solveAssignment(d)
+  console.log('用例21 预指派强制兑现')
+  check('可行', res.feasible, JSON.stringify(res.feasible ? '' : res.reasons))
+  if (res.feasible) {
+    const p1b = res.assignments.find((a) => a.paperId === 'p1' && a.reviewerId === 'b')
+    check('p1 必须分给被预指派的 b', !!p1b && p1b.preassigned === true, JSON.stringify(res.assignments))
+    check('p1→b 即便无标签匹配也接受（牺牲一个匹配）', p1b?.topicMatched === false)
+    check('来自预指派计数=1', res.objective.preassignedCount === 1, `got ${res.objective.preassignedCount}`)
+    check('p2 由剩余容量的 a 承担', !!res.assignments.find((a) => a.paperId === 'p2' && a.reviewerId === 'a' && !a.preassigned))
+    check('无人超容量', res.loads.every((l) => l.assigned <= l.capacity))
+  }
+}
+
+// 22. 预指派引用不存在：整体失败、不生成部分结果
+{
+  const d = mk([P('p1', 'A', 1, [], ['ghost'])], [R('a', '甲', 1)])
+  const res = solveAssignment(d)
+  console.log('用例22 预指派引用不存在')
+  check('不可行', !res.feasible)
+  if (!res.feasible) {
+    const r = res.reasons[0]
+    check('原因为 reviewer-missing 且带 issue（具体稿件/评审人）', r.kind === 'preassigned-reviewer-missing' && r.issue?.paperId === 'p1' && r.issue.reviewerId === 'ghost')
+  }
+}
+
+// 23. 预指派含利益冲突：失败并指明双方
+{
+  const d = mk(
+    [P('p1', 'A', 1, [], ['a'])],
+    [R('a', '甲', 2, [], ['p1']), R('b', '乙', 2)]
+  )
+  const res = solveAssignment(d)
+  console.log('用例23 预指派含利益冲突')
+  check('不可行', !res.feasible)
+  if (!res.feasible) {
+    check('原因为 preassigned-conflict', res.reasons.some((r) => r.kind === 'preassigned-conflict' && r.issue?.paperId === 'p1' && r.issue.reviewerId === 'a'))
+  }
+}
+
+// 24. 单人预占超过容量：同一评审人被 3 篇预指派，容量 2
+{
+  const d = mk(
+    [P('p1', 'A', 1, [], ['a']), P('p2', 'B', 1, [], ['a']), P('p3', 'C', 1, [], ['a'])],
+    [R('a', '甲', 2), R('b', '乙', 3)]
+  )
+  const res = solveAssignment(d)
+  console.log('用例24 预指派单人超容量')
+  check('不可行', !res.feasible)
+  if (!res.feasible) {
+    const over = res.reasons.filter((r) => r.kind === 'preassigned-over-capacity')
+    check('给出 over-capacity 原因且计数=3/容量=2', over.length === 3 && over.every((r) => r.issue?.preassignedCount === 3 && r.issue.limit === 2), JSON.stringify(res.reasons.map((r) => r.kind)))
+  }
+}
+
+// 25. 同篇预指派超过名额：需求 2 却预指派 3 人
+{
+  const d = mk(
+    [P('p1', 'A', 2, [], ['a', 'b', 'c'])],
+    [R('a', '甲', 2), R('b', '乙', 2), R('c', '丙', 2)]
+  )
+  const res = solveAssignment(d)
+  console.log('用例25 预指派同篇超名额')
+  check('不可行', !res.feasible)
+  if (!res.feasible) {
+    const over = res.reasons.filter((r) => r.kind === 'preassigned-over-quota')
+    check('仅对超出的 1 条关系报 over-quota（count=3/limit=2）', over.length === 1 && over[0].issue?.preassignedCount === 3 && over[0].issue.limit === 2, JSON.stringify(res.reasons.map((r) => r.kind)))
+  }
+}
+
+// 26. 预指派让本可行的残量问题撞组合瓶颈：p1,p2 都预指派 a，但 a 容量仅 1
+{
+  const d = mk(
+    [P('p1', 'A', 2, [], ['a']), P('p2', 'B', 2, [], ['a'])],
+    [R('a', '甲', 1), R('b', '乙', 1, [], ['p1', 'p2'])]
+  )
+  const res = solveAssignment(d)
+  console.log('用例26 预指派占满容量导致残量瓶颈')
+  check('不可行（a 被两篇预指派但容量1）', !res.feasible)
+  if (!res.feasible) {
+    check('含 over-capacity 预指派原因', res.reasons.some((r) => r.kind === 'preassigned-over-capacity'), JSON.stringify(res.reasons.map((r) => r.kind)))
+  }
+}
+
+// 27. 预指派对同人不重复：同篇重复 id 去重后 a,b 两人恰好满足需求 2，可行且各一条
+{
+  const d = mk([P('p1', 'A', 2, [], ['a', 'a', 'b'])], [R('a', '甲', 2), R('b', '乙', 2)])
+  const res = solveAssignment(d)
+  console.log('用例27 同篇重复预指派去重')
+  check('可行（重复 a 静默去重，a/b 各占一名额）', res.feasible)
+  if (res.feasible) {
+    check('每篇 2 人且无重复评审人', res.assignments.length === 2 && new Set(res.assignments.map((a) => a.reviewerId)).size === 2)
+  }
+}
+
+// 27b. 去重后只剩 1 位预指派、需求 1：可行且只有一条 a
+{
+  const d = mk([P('p1', 'A', 1, [], ['a', 'a'])], [R('a', '甲', 2), R('b', '乙', 2)])
+  const res = solveAssignment(d)
+  console.log('用例27b 重复预指派静默去重')
+  check('可行', res.feasible)
+  if (res.feasible) {
+    check('仅 1 条分派且为预指派 a', res.assignments.length === 1 && res.assignments[0].reviewerId === 'a' && res.assignments[0].preassigned)
+  }
+}
+
+// 28. 预指派下的负载均衡：预指派人不被强行多派；阶段二仍摊平非预指派负载
+{
+  const d = mk(
+    [P('p1', 'A', 1, [], ['a']), P('p2', 'B', 1), P('p3', 'C', 1), P('p4', 'D', 1)],
+    [R('a', '甲', 4), R('b', '乙', 4)]
+  )
+  const res = solveAssignment(d)
+  console.log('用例28 预指派+负载均衡')
+  if (res.feasible) check('最大负载=2（预指派 a 评 p1 后剩余三篇由两人摊平）', res.objective.maxLoad === 2, `got ${res.objective.maxLoad}`)
+}
+
+// 29. 互换工具锁定预指派：涉及预指派的分派不会出现在候选中
+{
+  const d = mk(
+    [P('p1', 'A', 1, [], ['a']), P('p2', 'B', 1)],
+    [R('a', '甲', 2), R('b', '乙', 2)]
+  )
+  const res = solveAssignment(d)
+  console.log('用例29 互换排除预指派')
+  if (res.feasible) {
+    const en = enumerateSwaps(d, res, 'a', 'b')
+    check('涉及预指派分派的互换候选为 0', en.candidates.length === 0)
+    check('预指派锁定计数=1（a 的 p1 × b 的 p2）', en.excluded.preassigned === 1, `got ${en.excluded.preassigned}`)
+  }
+}
+
+// 30. 失效预指派保留在数据中：分析器可见，但可被用户移除后恢复可行
+{
+  const d = mk([P('p1', 'A', 1, [], ['gone'])], [R('a', '甲', 2)])
+  const first = solveAssignment(d)
+  console.log('用例30 失效关系保留并可移除')
+  check('初始失败', !first.feasible)
+  const fixed: AppData = { ...d, papers: d.papers.map((p) => ({ ...p, preassignedReviewerIds: [] })) }
+  const again = solveAssignment(fixed)
+  check('移除失效关系后可生成方案', again.feasible)
+}
+
+// 31. 旧数据兼容：没有 preassignedReviewerIds 字段的数据照常求解
+{
+  const legacy = JSON.parse(JSON.stringify(mk([P('p1', 'A', 1)], [R('a', '甲', 1)])))
+  delete legacy.papers[0].preassignedReviewerIds
+  const res = solveAssignment(legacy)
+  console.log('用例31 旧数据兼容')
+  check('旧数据可行', res.feasible)
+}
+
+// 32. 预指派 × 缺席压力测试：被预指派的评审人缺席 → 预指派违规，场景不可行并带原因
+{
+  const d = mk(
+    [P('p1', 'A', 2, [], ['a']), P('p2', 'B', 2)],
+    [R('a', '甲', 2), R('b', '乙', 2), R('c', '丙', 4)]
+  )
+  const base = solveAssignment(d)
+  console.log('用例32 预指派下的缺席压力测试')
+  check('基线可行', base.feasible, JSON.stringify(base.feasible ? '' : base.reasons))
+  const out = runStressTest(d)
+  if (out.runnable) {
+    const a = out.report.scenarios.find((s) => s.reviewerId === 'a')
+    check('被预指派的甲缺席 → 不可行', !!a && !a.feasible)
+    check('结论中点名预指派硬约束', !!a && a.message.includes('预指派'), a?.message.slice(0, 80))
+  }
+}
+
+// 33. 预指派变化进入数据指纹：增删预指派后指纹改变
+{
+  const d1 = mk([P('p1', 'A', 1, [], ['a'])], [R('a', '甲', 2), R('b', '乙', 2)])
+  const d2 = mk([P('p1', 'A', 1, [], ['b'])], d1.reviewers)
+  console.log('用例33 预指派进入指纹')
+  check('预指派对象变化指纹改变', stressFingerprint(d1) !== stressFingerprint(d2))
+  const d3 = mk([P('p1', 'A', 1)], d1.reviewers)
+  check('移除预指派指纹改变', stressFingerprint(d3) !== stressFingerprint(d1))
 }
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)

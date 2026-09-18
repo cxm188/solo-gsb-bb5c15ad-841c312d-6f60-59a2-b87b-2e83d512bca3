@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { AppData, AssignmentResult, Paper, Reviewer, StressTestReport } from './types'
+import type { AppData, AssignmentResult, Paper, PreassignmentIssue, Reviewer, StressTestReport } from './types'
 import { loadData, saveData } from './storage'
 import { solveAssignment, evaluateHardConstraints } from './engine/solver'
+import { analyzePreassignments } from './engine/preassign'
 import { runStressTest, stressFingerprint } from './engine/stress'
 import { applySwapCandidate, type SwapCandidate } from './engine/swap'
 import { createSampleData } from './sampleData'
@@ -47,6 +48,18 @@ export default function App() {
     for (const r of data.reviewers) for (const pid of r.conflictPaperIds) map.set(pid, (map.get(pid) ?? 0) + 1)
     return (paperId: string) => map.get(paperId) ?? 0
   }, [data.reviewers])
+
+  // 预指派失效/违规关系（即时校验，供稿件编辑区显式提示与逐条移除；不静默清除）
+  const preassignIssuesByPaper = useMemo(() => {
+    const { issues } = analyzePreassignments(data)
+    const map = new Map<string, PreassignmentIssue[]>()
+    for (const issue of issues) {
+      const list = map.get(issue.paperId) ?? []
+      list.push(issue)
+      map.set(issue.paperId, list)
+    }
+    return map
+  }, [data])
 
   const setPapers = (papers: Paper[]) => setData((d) => ({ ...d, papers }))
   const setReviewers = (reviewers: Reviewer[]) => setData((d) => ({ ...d, reviewers }))
@@ -160,7 +173,15 @@ export default function App() {
       </nav>
 
       <main className="content">
-        {tab === 'papers' && <PapersPanel papers={data.papers} onChange={setPapers} conflictCountOf={conflictCountOf} />}
+        {tab === 'papers' && (
+          <PapersPanel
+            papers={data.papers}
+            reviewers={data.reviewers}
+            onChange={setPapers}
+            conflictCountOf={conflictCountOf}
+            preassignIssuesByPaper={preassignIssuesByPaper}
+          />
+        )}
         {tab === 'reviewers' && <ReviewersPanel papers={data.papers} reviewers={data.reviewers} onChange={setReviewers} />}
         {tab === 'result' &&
           (solving ? (

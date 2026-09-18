@@ -7,6 +7,12 @@ export interface Paper {
   reviewsRequired: number
   /** 主题标签 */
   tags: string[]
+  /**
+   * 预指派评审人 id 列表（硬约束）：生成分派时这些评审人必须评阅本稿。
+   * 可选字段，旧数据缺省视为空列表；允许暂时引用失效对象（评审人已删除等），
+   * 失效关系由界面与求解器显式报告，不在这里静默清除。
+   */
+  preassignedReviewerIds?: string[]
 }
 
 export interface Reviewer {
@@ -33,6 +39,8 @@ export interface AssignmentItem {
   topicMatched: boolean
   /** 命中的共同标签 */
   matchedTags: string[]
+  /** 是否来自用户预指派（预指派关系作为硬约束被求解器兑现） */
+  preassigned: boolean
 }
 
 /** 评审人在结果中的负载信息 */
@@ -42,7 +50,27 @@ export interface ReviewerLoad {
   capacity: number
 }
 
+/** 预指派关系的失效/违规种类（求解前逐条校验） */
+export type PreassignmentIssueKind =
+  | 'preassigned-reviewer-missing'
+  | 'preassigned-conflict'
+  | 'preassigned-over-capacity'
+  | 'preassigned-over-quota'
+
+/** 一条失效或违规的预指派关系 */
+export interface PreassignmentIssue {
+  kind: PreassignmentIssueKind
+  paperId: string
+  reviewerId: string
+  /** 人类可读的具体原因（含稿件名/评审人名，失效对象回退为其 id） */
+  message: string
+  /** over-capacity 时该评审人被预占的名额数 / 容量；over-quota 时本稿预指数 / 需求名额 */
+  preassignedCount?: number
+  limit?: number
+}
+
 export type InfeasibleKind =
+  | PreassignmentIssueKind
   | 'global-capacity'
   | 'paper-eligible'
   | 'subset-bottleneck'
@@ -56,6 +84,8 @@ export interface InfeasibleReason {
   reviewerIds?: string[]
   /** subset-bottleneck 时: 缺口数量 */
   deficit?: number
+  /** kind 为预指派类时：对应的结构化失效关系（稿件/评审人/原因） */
+  issue?: PreassignmentIssue
 }
 
 export interface AssignmentSuccess {
@@ -67,6 +97,8 @@ export interface AssignmentSuccess {
     maxLoad: number
     totalAssigned: number
     totalRequired: number
+    /** 其中来自预指派硬约束的分派条数 */
+    preassignedCount: number
   }
   /** 是否经过「分派互换」人工调整（重新生成分派后清空） */
   manuallyAdjusted?: boolean
