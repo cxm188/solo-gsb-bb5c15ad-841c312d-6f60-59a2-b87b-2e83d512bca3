@@ -1,5 +1,6 @@
 import solver from 'javascript-lp-solver'
 import { checkFeasibility } from './maxflow'
+import { buildForcedMatrix, dedupePreAssignments, validatePreAssignments, type ForcedMatrix } from './preassign'
 import type {
   AppData,
   AssignmentItem,
@@ -7,6 +8,7 @@ import type {
   AssignmentSuccess,
   InfeasibleReason,
   Paper,
+  PreAssignment,
   Reviewer,
   ReviewerLoad
 } from '../types'
@@ -30,6 +32,8 @@ function normalizeTags(raw: string[]): string[] {
 interface Normalized {
   papers: Paper[]
   reviewers: Reviewer[]
+  /** 去重后的预指派关系（失效引用不在此阶段剔除，由预检逐条报告） */
+  preAssignments: PreAssignment[]
 }
 
 function normalize(data: AppData): Normalized {
@@ -52,7 +56,7 @@ function normalize(data: AppData): Normalized {
     }))
     .filter((r) => r.name.length > 0)
 
-  return { papers, reviewers }
+  return { papers, reviewers, preAssignments: dedupePreAssignments(data.preAssignments ?? []) }
 }
 
 function hasConflict(paper: Paper, reviewer: Reviewer): boolean {
@@ -95,47 +99,27 @@ export interface HardConstraintEvaluation {
   demands: number[]
   capacities: number[]
   totalRequired: number
+  /** 归一化（去重）后的预指派关系，顺序与存储一致 */
+  preAssignments: PreAssignment[]
+  /** 预指派问题（逐条）；非空时整体不可行，且不生成任何部分结果 */
+  preAssignmentIssues: ReturnType<typeof validatePreAssignments>
+  /** 有效预指派矩阵（仅在预检通过时有意义） */
+  forced: ForcedMatrix
+  /** 预指派占用后，评审人 j 对“自由名额”的剩余容量 = 容量 − 被预指派数 */
+  residualCapacities: number[]
+  /** 预指派占用后，稿件 i 仍需自由分配的名额 = 需求 − 预指派数 */
+  residualDemands: number[]
 }
 
 /**
- * 仅评估硬约束（冲突 / 容量 / 人数），不做任何目标优化、不改变输入数据。
- * 缺席压力测试把某位评审人容量改为 0 后调用本函数，即“使用既有硬约束可行性逻辑重新判定”。
+ * 仅评估硬约束（冲突 / 容量 / 人数 / 预指派），不做任何目标优化、不改变输入数据。
+ * 缺席压力测试把某位评审人容量改为 0 后调用本函数，即“使用既有硬约束可行性逻辑重新判定”
+ * （预指派同样是硬约束：容量置 0 后，被该评审人预占的名额会立刻显现为超限）。
  */
 export function evaluateHardConstraints(rawData: AppData): HardConstraintEvaluation {
-  const { papers, reviewers } = normalize(rawData)
+  const { papers, reviewers, preAssignments } = normalize(rawData)
   const P = papers.length
   const R = reviewers.length
-  const reasons: InfeasibleReason[] = []
-
-  // ---- 退化情形 ----
-  if (P === 0) {
-    return {
-      feasible: false,
-      reasons: [{ kind: 'paper-eligible', message: '没有需要分配的有效稿件（请至少录入一篇需要评审的稿件）。' }],
-      papers,
-      reviewers,
-      eligible: [],
-      demands: [],
-      capacities: reviewers.map((r) => r.capacity),
-      totalRequired: 0
-    }
-  }
-  if (R === 0) {
-    reasons.push({
-      kind: 'global-capacity',
-      message: `尚未录入任何评审人，${papers.reduce((a, p) => a + p.reviewsRequired, 0)} 个评审名额无人承担。`
-    })
-    return {
-      feasible: false,
-      reasons,
-      papers,
-      reviewers,
-      eligible: papers.map(() => []),
-      demands: papers.map((p) => p.reviewsRequired),
-      capacities: [],
-      totalRequired: papers.reduce((a, p) => a + p.reviewsRequired, 0)
-    }
-  }
 
   // ---- 冲突矩阵 ----
   const eligible: boolean[][] = papers.map((p) => reviewers.map((r) => !hasConflict(p, r)))
@@ -143,61 +127,136 @@ export function evaluateHardConstraints(rawData: AppData): HardConstraintEvaluat
   const capacities = reviewers.map((r) => r.capacity)
   const totalRequired = demands.reduce((a, b) => a + b, 0)
 
+  // ---- 预指派预检（最高优先级）：引用缺失 / 利益冲突 / 同篇超额 / 单人超容量 ----
+  const preAssignmentIssues = validatePreAssignments(papers, reviewers, preAssignments)
+  const forced = buildForcedMatrix(papers, reviewers, preAssignments, eligible)
+  const residualCapacities = reviewers.map((r, j) => {
+    const reserved = papers.reduce((n, _, i) => n + (forced.forcedByPaperIndex[i].has(j) ? 1 : 0), 0)
+    return r.capacity - reserved
+  })
+  const residualDemands = demands.map((d, i) => d - forced.forcedByPaperIndex[i].size)
+
+  const emptyEval = (reasons: InfeasibleReason[]): HardConstraintEvaluation => ({
+    feasible: false,
+    reasons,
+    papers,
+    reviewers,
+    preAssignments,
+    eligible,
+    demands,
+    capacities,
+    totalRequired,
+    preAssignmentIssues,
+    forced,
+    residualCapacities,
+    residualDemands
+  })
+
+  if (preAssignmentIssues.length > 0) {
+    return emptyEval([
+      {
+        kind: 'preassignment',
+        message:
+          `预指派关系存在 ${preAssignmentIssues.length} 条无法满足的问题。预指派是生成分派时必须满足的硬约束，` +
+          `任一问题存在时都不会生成部分结果；请逐条移除或修正后重新生成。`,
+        issues: preAssignmentIssues
+      }
+    ])
+  }
+
+  const reasons: InfeasibleReason[] = []
+
+  // ---- 退化情形 ----
+  if (P === 0) {
+    return emptyEval([
+      { kind: 'paper-eligible', message: '没有需要分配的有效稿件（请至少录入一篇需要评审的稿件）。' }
+    ])
+  }
+  if (R === 0) {
+    reasons.push({
+      kind: 'global-capacity',
+      message: `尚未录入任何评审人，${papers.reduce((a, p) => a + p.reviewsRequired, 0)} 个评审名额无人承担。`
+    })
+    return emptyEval(reasons)
+  }
+
   // ---- 原因 1（最具体）：单篇稿件可分配评审人数不足 ----
+  // 预指派占用的评审人已确定占住该篇名额，单篇只需再找到 需求−预指派数 位不同评审人。
   const perPaperFailures: InfeasibleReason[] = []
   for (let i = 0; i < P; i++) {
-    const avail = eligible[i].filter(Boolean).length
-    if (avail < demands[i]) {
+    const reserved = forced.forcedByPaperIndex[i]
+    const avail = eligible[i].filter(Boolean).length - reserved.size
+    const need = residualDemands[i]
+    if (avail < need) {
+      const forcedNames = [...reserved].map((j) => reviewers[j].name)
       perPaperFailures.push({
         kind: 'paper-eligible',
         paperIds: [papers[i].id],
-        message: `《${papers[i].title}》需要 ${demands[i]} 位评审人，但无利益冲突且可分配的评审人仅 ${avail} 位（缺口 ${demands[i] - avail}）。`
+        message:
+          `《${papers[i].title}》需要 ${demands[i]} 位评审人` +
+          (reserved.size > 0
+            ? `（其中 ${reserved.size} 位已由预指派确定：${forcedNames.join('、')}），还需 ${need} 位`
+            : '') +
+          `，但其余无利益冲突的评审人仅 ${Math.max(0, avail)} 位（缺口 ${need - Math.max(0, avail)}）。`
       })
     }
   }
 
-  // ---- 全局容量（忽略冲突后所有评审人可承担的总名额）----
-  const totalCapacity = capacities.reduce((a, b) => a + b, 0)
-  if (totalCapacity < totalRequired) {
+  // ---- 全局容量：预指派已提前占住各评审人名额，自由名额总量不得少于剩余总需求 ----
+  const totalResidualCapacity = residualCapacities.reduce((a, b) => a + b, 0)
+  const totalResidualDemand = residualDemands.reduce((a, b) => a + b, 0)
+  if (totalResidualCapacity < totalResidualDemand) {
+    const totalForced = forced.forcedKeys.size
     reasons.push({
       kind: 'global-capacity',
       reviewerIds: reviewers.map((r) => r.id),
-      message: `全部稿件共需 ${totalRequired} 个评审名额，而 ${R} 位评审人的容量合计仅 ${totalCapacity}（缺口 ${totalRequired - totalCapacity}）。请增加评审人或提高容量。`
+      message:
+        totalForced > 0
+          ? `全部稿件共需 ${totalRequired} 个名额，其中 ${totalForced} 个已由预指派提前占住；剩余 ${totalResidualDemand} 个自由名额，而评审人的剩余容量合计仅 ${totalResidualCapacity}（缺口 ${totalResidualDemand - totalResidualCapacity}）。请增加评审人、提高容量或减少预指派。`
+          : `全部稿件共需 ${totalRequired} 个评审名额，而 ${R} 位评审人的容量合计仅 ${capacities.reduce((a, b) => a + b, 0)}（缺口 ${totalRequired - capacities.reduce((a, b) => a + b, 0)}）。请增加评审人或提高容量。`
     })
   }
 
-  // ---- 最大流可行性检验 ----
-  const feas = checkFeasibility({ demands, capacities, eligible })
+  // ---- 最大流可行性检验（残量视角）----
+  // 预指派边视为已固定发送的流量：网络中只保留“自由”边（非预指派），
+  // 源→稿件容量为剩余需求，评审人→汇容量为剩余容量（容量−预占）。
+  const residualEligible: boolean[][] = papers.map((_, i) =>
+    reviewers.map((_, j) => eligible[i][j] && !forced.forcedByPaperIndex[i].has(j))
+  )
+  const feas = checkFeasibility({ demands: residualDemands, capacities: residualCapacities, eligible: residualEligible })
 
   if (!feas.feasible && reasons.length === 0 && perPaperFailures.length === 0) {
     // 组合性瓶颈（广义 Hall 条件违反）：
-    // 取残量网源侧可达稿件集合 Z，令 Y 为与 Z 中任一稿件无冲突的全部评审人。
-    // 因 Z→(R\Y) 的边在最大流中全部饱和，Y 是紧见证：
-    //   demand(Z) > Σ_j∈Y min(容量_j, |Z 中与 j 相连的稿件数|)。
+    // 取残量网源侧可达稿件集合 Z，令 Y 为与 Z 中任一稿件无冲突、且仍有自由容量的全部评审人。
+    // 因 Z→(R\Y) 的自由边在最大流中全部饱和，Y 是紧见证：
+    //   剩余需求(Z) > Σ_j∈Y min(剩余容量_j, |Z 中与 j 有自由边的稿件数|)。
     const Zidx = feas.sourceReachablePapers
     const Zset = Zidx.map((i) => papers[i])
     const Yidx: number[] = []
     for (let j = 0; j < R; j++) {
-      if (Zidx.some((i) => eligible[i][j])) Yidx.push(j)
+      if (residualCapacities[j] <= 0) continue
+      if (Zidx.some((i) => residualEligible[i][j])) Yidx.push(j)
     }
     const Yset = Yidx.map((j) => reviewers[j])
-    const demandZ = Zset.reduce((a, p) => a + p.reviewsRequired, 0)
+    const demandZ = Zidx.reduce((a, i) => a + residualDemands[i], 0)
     let capY = 0
     for (const j of Yidx) {
-      const degree = Zidx.reduce((n, i) => n + (eligible[i][j] ? 1 : 0), 0)
-      capY += Math.min(reviewers[j].capacity, degree)
+      const degree = Zidx.reduce((n, i) => n + (residualEligible[i][j] ? 1 : 0), 0)
+      capY += Math.min(residualCapacities[j], degree)
     }
+    const totalForced = forced.forcedKeys.size
     reasons.push({
       kind: 'subset-bottleneck',
       paperIds: Zset.map((p) => p.id),
       reviewerIds: Yset.map((r) => r.id),
       deficit: demandZ - capY,
       message:
-        `存在一组 ${Zset.length} 篇稿件，其可选评审人范围相互重叠、形成容量瓶颈：它们共需 ${demandZ} 个名额，` +
-        `而 ${Yset.length} 位无冲突的评审人对这组稿件至多能承担 ${capY} 个名额（缺口 ${demandZ - capY}，已计入每位评审人对同一篇稿件至多评一次）。\n` +
+        `存在一组 ${Zset.length} 篇稿件，其可选评审人范围相互重叠、形成容量瓶颈：扣除预指派后它们共需 ${demandZ} 个自由名额，` +
+        `而 ${Yset.length} 位无冲突且仍有剩余容量的评审人对这组稿件至多能承担 ${capY} 个自由名额（缺口 ${demandZ - capY}，已计入每位评审人对同一篇稿件至多评一次）。\n` +
         `瓶颈稿件：${Zset.map((p) => `《${p.title}》`).join('、')}；\n` +
-        `可选评审人：${Yset.length ? Yset.map((r) => r.name).join('、') : '（无，全部存在利益冲突）'}。\n` +
-        `建议：为这些稿件补充评审人、解除部分冲突或提高相关评审人容量。`
+        `可选评审人：${Yset.length ? Yset.map((r) => r.name).join('、') : '（无，全部存在利益冲突或容量已被预指派占满）'}。\n` +
+        (totalForced > 0 ? `预指派已提前占住 ${totalForced} 个名额；` : '') +
+        `建议：为这些稿件补充评审人、解除部分冲突、提高相关评审人容量，或调整预指派。`
     })
   }
 
@@ -206,10 +265,15 @@ export function evaluateHardConstraints(rawData: AppData): HardConstraintEvaluat
     reasons: feas.feasible ? [] : [...perPaperFailures, ...reasons],
     papers,
     reviewers,
+    preAssignments,
     eligible,
     demands,
     capacities,
-    totalRequired
+    totalRequired,
+    preAssignmentIssues,
+    forced,
+    residualCapacities,
+    residualDemands
   }
 }
 
@@ -217,23 +281,24 @@ export function evaluateHardConstraints(rawData: AppData): HardConstraintEvaluat
  * 核心入口：执行盲审分配。
  *
  * 硬约束（全部必须满足，否则不可行）:
- *  1. 利益冲突：声明冲突的稿件-评审人对绝不分配；
- *  2. 容量：每位评审人承担稿件数不超过 capacity；
- *  3. 人数：每篇稿件恰好得到 reviewsRequired 位互不相同的评审人。
+ *  1. 预指派：显式指定的（稿件，评审人）对必须出现在分派中；
+ *  2. 利益冲突：声明冲突的稿件-评审人对绝不分配；
+ *  3. 容量：每位评审人承担稿件数不超过 capacity（含被预指派预占的名额）；
+ *  4. 人数：每篇稿件恰好得到 reviewsRequired 位互不相同的评审人。
  *
  * 优化目标（硬约束满足后）:
  *  第一优先 最大化稿件主题标签与评审人擅长标签的匹配数；
  *  第二优先 最小化评审人最大负载（负载均衡）。
  */
 export function solveAssignment(rawData: AppData): AssignmentResult {
-  // ---- 硬约束可行性（与缺席压力测试共用同一套判定逻辑） ----
+  // ---- 硬约束可行性（与缺席压力测试共用同一套判定逻辑；预指派问题在此逐条报告） ----
   const hc = evaluateHardConstraints(rawData)
   if (!hc.feasible) {
     return { feasible: false, reasons: hc.reasons }
   }
 
-  // ---- 硬约束可行：用整数规划做目标优化 ----
-  return optimize(hc.papers, hc.reviewers, hc.eligible, hc.demands, hc.totalRequired)
+  // ---- 硬约束可行：用整数规划做目标优化（预指派关系作为强制变量） ----
+  return optimize(hc.papers, hc.reviewers, hc.eligible, hc.demands, hc.totalRequired, hc.forced)
 }
 
 /* ------------------------------ 整数规划优化 ------------------------------ */
@@ -258,7 +323,8 @@ function runPhase(
   eligible: boolean[][],
   demands: number[],
   totalRequired: number,
-  capLimit: number | null
+  capLimit: number | null,
+  forced: ForcedMatrix
 ): PhaseSolution {
   const P = papers.length
   const R = reviewers.length
@@ -283,10 +349,14 @@ function runPhase(
   reviewers.forEach((r, j) => {
     model.constraints[`reviewer_${j}`] = { max: capLimit === null ? r.capacity : Math.min(r.capacity, capLimit) }
   })
+  // 预指派硬约束：对应二元变量必须取 1（与冲突/容量/人数共同求解，不是事后补丁）
+  for (const key of forced.forcedKeys) {
+    model.constraints[`pre_${key}`] = { equal: 1 }
+  }
 
   for (let i = 0; i < P; i++) {
     for (let j = 0; j < R; j++) {
-      if (!eligible[i][j]) continue // 冲突对不生成变量 —— 硬约束 1
+      if (!eligible[i][j]) continue // 冲突对不生成变量 —— 硬约束：利益冲突
       const varName = `x_${i}_${j}`
       const matched = matchedTagsOf(papers[i], reviewers[j]).length > 0
       model.binaries[varName] = 1
@@ -294,6 +364,9 @@ function runPhase(
         [`paper_${i}`]: 1,
         [`reviewer_${j}`]: 1,
         objective: matched ? 1 : 0
+      }
+      if (forced.forcedKeys.has(`${i}_${j}`)) {
+        model.variables[varName][`pre_${i}_${j}`] = 1
       }
     }
   }
@@ -313,7 +386,8 @@ function parseSolution(
   papers: Paper[],
   reviewers: Reviewer[],
   eligible: boolean[][],
-  raw: Record<string, number>
+  raw: Record<string, number>,
+  forced: ForcedMatrix
 ): AssignmentItem[] {
   const P = papers.length
   const R = reviewers.length
@@ -323,11 +397,13 @@ function parseSolution(
       if (!eligible[i][j]) continue
       if (Math.round(raw[`x_${i}_${j}`] ?? 0) !== 1) continue
       const matched = matchedTagsOf(papers[i], reviewers[j])
+      const isForced = forced.forcedKeys.has(`${i}_${j}`)
       assignments.push({
         paperId: papers[i].id,
         reviewerId: reviewers[j].id,
         topicMatched: matched.length > 0,
-        matchedTags: matched
+        matchedTags: matched,
+        preassigned: isForced || undefined
       })
     }
   }
@@ -355,7 +431,8 @@ function buildSuccess(
       topicMatches: assignments.filter((a) => a.topicMatched).length,
       maxLoad: Math.max(0, ...loads.map((l) => l.assigned)),
       totalAssigned: assignments.length,
-      totalRequired
+      totalRequired,
+      preassignedCount: assignments.filter((a) => a.preassigned === true).length
     }
   }
 }
@@ -365,23 +442,24 @@ function optimize(
   reviewers: Reviewer[],
   eligible: boolean[][],
   demands: number[],
-  totalRequired: number
+  totalRequired: number,
+  forced: ForcedMatrix
 ): AssignmentSuccess {
   const R = reviewers.length
 
-  // 阶段一：真实容量下最大化主题匹配数，得到最优匹配数 M*
-  const phase1 = runPhase(papers, reviewers, eligible, demands, totalRequired, null)
+  // 阶段一：真实容量下最大化主题匹配数（预指派变量固定为 1），得到最优匹配数 M*
+  const phase1 = runPhase(papers, reviewers, eligible, demands, totalRequired, null, forced)
 
   // 理论上最大流已保证可行；求解器异常时退回贪心可行解
   if (!phase1.feasible) {
-    return greedyFallback(papers, reviewers, eligible, demands, totalRequired)
+    return greedyFallback(papers, reviewers, eligible, demands, totalRequired, forced)
   }
   const bestMatches = phase1.matches
   let bestRaw = phase1.raw
 
   // 阶段二：在不损失任何主题匹配（匹配数仍为 M*）的前提下，二分最小化最大负载 L。
   // 上界直接取阶段一解的最大负载，下界取总名额按人均摊的向上取整。
-  const phase1Items = parseSolution(papers, reviewers, eligible, phase1.raw)
+  const phase1Items = parseSolution(papers, reviewers, eligible, phase1.raw, forced)
   const phase1Counts = new Map<string, number>()
   for (const a of phase1Items) phase1Counts.set(a.reviewerId, (phase1Counts.get(a.reviewerId) ?? 0) + 1)
   const upperL = Math.max(1, ...reviewers.map((r) => phase1Counts.get(r.id) ?? 0))
@@ -390,7 +468,7 @@ function optimize(
 
   while (lo < hi) {
     const mid = (lo + hi) >> 1
-    const r = runPhase(papers, reviewers, eligible, demands, totalRequired, mid)
+    const r = runPhase(papers, reviewers, eligible, demands, totalRequired, mid, forced)
     if (r.feasible && r.matches === bestMatches) {
       hi = mid
       bestRaw = r.raw
@@ -399,38 +477,65 @@ function optimize(
     }
   }
 
-  const assignments = parseSolution(papers, reviewers, eligible, bestRaw)
+  const assignments = parseSolution(papers, reviewers, eligible, bestRaw, forced)
   if (assignments.length !== totalRequired) {
-    return greedyFallback(papers, reviewers, eligible, demands, totalRequired)
+    return greedyFallback(papers, reviewers, eligible, demands, totalRequired, forced)
+  }
+  // 防御性校验：求解结果必须完整包含全部预指派
+  for (const key of forced.forcedKeys) {
+    const [i, j] = key.split('_').map(Number)
+    if (!assignments.some((a) => a.paperId === papers[i].id && a.reviewerId === reviewers[j].id)) {
+      return greedyFallback(papers, reviewers, eligible, demands, totalRequired, forced)
+    }
   }
   return buildSuccess(reviewers, assignments, totalRequired)
 }
 
-/** 求解器异常时的兜底：按主题匹配优先、当前负载最低的评审人贪心选取（最大流已保证存在可行解） */
+/** 求解器异常时的兜底：先放入全部预指派，再按主题匹配优先、当前负载最低贪心选取（最大流已保证存在可行解） */
 function greedyFallback(
   papers: Paper[],
   reviewers: Reviewer[],
   eligible: boolean[][],
   demands: number[],
-  totalRequired: number
+  totalRequired: number,
+  forced: ForcedMatrix
 ): AssignmentSuccess {
   const assigned = new Map<string, number>(reviewers.map((r) => [r.id, 0]))
   const assignments: AssignmentItem[] = []
+  const placed = new Set<string>()
+
+  // 预指派先无条件占位（预检已保证其不冲突、不超额）
+  for (let i = 0; i < papers.length; i++) {
+    for (const j of forced.forcedByPaperIndex[i]) {
+      const matched = matchedTagsOf(papers[i], reviewers[j])
+      assignments.push({
+        paperId: papers[i].id,
+        reviewerId: reviewers[j].id,
+        topicMatched: matched.length > 0,
+        matchedTags: matched,
+        preassigned: true
+      })
+      assigned.set(reviewers[j].id, (assigned.get(reviewers[j].id) ?? 0) + 1)
+      placed.add(`${i}_${j}`)
+    }
+  }
 
   const ordered = [...papers].sort((a, b) => b.reviewsRequired - a.reviewsRequired)
   for (const paper of ordered) {
     const i = papers.indexOf(paper)
+    const need = demands[i] - forced.forcedByPaperIndex[i].size
     const choices = reviewers
       .map((r, j) => ({ r, j, matched: matchedTagsOf(paper, r) }))
-      .filter(({ j }) => eligible[i][j])
+      .filter(({ j }) => eligible[i][j] && !placed.has(`${i}_${j}`))
       .sort((a, b) => {
         if ((a.matched.length > 0 ? 1 : 0) !== (b.matched.length > 0 ? 1 : 0)) return b.matched.length - a.matched.length
         return (assigned.get(a.r.id) ?? 0) - (assigned.get(b.r.id) ?? 0)
       })
-    for (let k = 0; k < demands[i]; k++) {
+    for (let k = 0; k < need; k++) {
       const pick = choices[k]
       if (!pick) break
       assigned.set(pick.r.id, (assigned.get(pick.r.id) ?? 0) + 1)
+      placed.add(`${i}_${pick.j}`)
       assignments.push({
         paperId: paper.id,
         reviewerId: pick.r.id,

@@ -19,6 +19,7 @@ export function createSampleData() {
       { id: r2, name: 'Bob（推荐/ML）', tags: ['机器学习', '推荐系统', 'NLP'], capacity: 2, conflictPaperIds: [] },
       { id: r3, name: 'Carol（系统/数据库）', tags: ['分布式系统', '数据库', '存储'], capacity: 3, conflictPaperIds: [p3] },
       { id: r4, name: 'Dave（安全/隐私）', tags: ['安全', '隐私', '机器学习'], capacity: 2, conflictPaperIds: [] }
-    ]
+    ],
+    preAssignments: []
   }
 }

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AppData, AssignmentResult, Paper, Reviewer, StressTestReport } from './types'
-import { loadData, saveData } from './storage'
+import { createId, loadData, saveData } from './storage'
 import { solveAssignment, evaluateHardConstraints } from './engine/solver'
 import { runStressTest, stressFingerprint } from './engine/stress'
 import { applySwapCandidate, type SwapCandidate } from './engine/swap'
@@ -14,7 +14,7 @@ import './styles.css'
 
 type Tab = 'papers' | 'reviewers' | 'result' | 'stress'
 
-const EMPTY: AppData = { papers: [], reviewers: [] }
+const EMPTY: AppData = { papers: [], reviewers: [], preAssignments: [] }
 
 export default function App() {
   const [data, setData] = useState<AppData>(() => loadData() ?? EMPTY)
@@ -50,6 +50,17 @@ export default function App() {
 
   const setPapers = (papers: Paper[]) => setData((d) => ({ ...d, papers }))
   const setReviewers = (reviewers: Reviewer[]) => setData((d) => ({ ...d, reviewers }))
+
+  // ---- 预指派关系维护 ----
+  // 关系独立存储：删除/修改稿件或评审人后，失效关系仍保留（不级联删除），
+  // 由稿件编辑区显式列出并提示原因，用户可逐条移除。
+  const addPreAssignment = (paperId: string, reviewerId: string) =>
+    setData((d) => {
+      if (d.preAssignments.some((pa) => pa.paperId === paperId && pa.reviewerId === reviewerId)) return d
+      return { ...d, preAssignments: [...d.preAssignments, { id: createId('pre'), paperId, reviewerId }] }
+    })
+  const removePreAssignment = (id: string) =>
+    setData((d) => ({ ...d, preAssignments: d.preAssignments.filter((pa) => pa.id !== id) }))
 
   const generate = () => {
     // 让“求解中”状态先渲染，再执行同步求解（大规模 ILP 可能耗时数百毫秒至数秒）
@@ -160,7 +171,17 @@ export default function App() {
       </nav>
 
       <main className="content">
-        {tab === 'papers' && <PapersPanel papers={data.papers} onChange={setPapers} conflictCountOf={conflictCountOf} />}
+        {tab === 'papers' && (
+          <PapersPanel
+            papers={data.papers}
+            reviewers={data.reviewers}
+            preAssignments={data.preAssignments}
+            onChange={setPapers}
+            onAddPreAssignment={addPreAssignment}
+            onRemovePreAssignment={removePreAssignment}
+            conflictCountOf={conflictCountOf}
+          />
+        )}
         {tab === 'reviewers' && <ReviewersPanel papers={data.papers} reviewers={data.reviewers} onChange={setReviewers} />}
         {tab === 'result' &&
           (solving ? (

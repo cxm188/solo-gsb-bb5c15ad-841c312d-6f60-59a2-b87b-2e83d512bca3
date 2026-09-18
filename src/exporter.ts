@@ -14,6 +14,8 @@ export interface ExportPayload {
     reviewerName: string
     topicMatched: boolean
     matchedTags: string[]
+    /** 是否来自预指派硬约束（非预指派缺省为 false） */
+    preassigned: boolean
   }>
   reviewerLoads: Array<{
     reviewerId: string
@@ -38,7 +40,8 @@ export function buildExportPayload(data: AppData, result: AssignmentSuccess): Ex
       reviewerId: a.reviewerId,
       reviewerName: reviewerMap.get(a.reviewerId)?.name ?? a.reviewerId,
       topicMatched: a.topicMatched,
-      matchedTags: a.matchedTags
+      matchedTags: a.matchedTags,
+      preassigned: a.preassigned === true
     })),
     reviewerLoads: result.loads.map((l) => ({
       reviewerId: l.reviewerId,

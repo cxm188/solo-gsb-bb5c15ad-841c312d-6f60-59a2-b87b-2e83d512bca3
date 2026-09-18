@@ -14,7 +14,9 @@ import App from '../src/App'
 import { createSampleData } from '../src/sampleData'
 import { solveAssignment, computeMatchedTags } from '../src/engine/solver'
 import { ResultPanel } from '../src/components/ResultPanel'
+import { PapersPanel } from '../src/components/PapersPanel'
 import { buildExportPayload } from '../src/exporter'
+import type { AppData } from '../src/types'
 
 // 初始空数据渲染
 const html1 = renderToString(React.createElement(App))
@@ -72,4 +74,73 @@ console.log('✓ 示例数据渲染成功，长度', html2.length)
 
   // 匹配标签计算在面板外可复用（互换重算口径）
   if (computeMatchedTags(data.papers[0], data.reviewers[0]).length < 0) throw new Error('匹配标签计算异常')
+}
+
+// 预指派：稿件面板渲染“预指派”编辑区；成功结果/失败结果/导出均体现预指派
+{
+  const base = createSampleData()
+  const data: AppData = {
+    ...base,
+    // p1 预指派给 Bob（无冲突）；另一条引用已删除评审人（失效关系，必须保留并提示）
+    preAssignments: [
+      { id: 'pre_ok', paperId: base.papers[0].id, reviewerId: 'rev_bob' },
+      { id: 'pre_gone', paperId: base.papers[1].id, reviewerId: 'rev_deleted' }
+    ]
+  }
+
+  const papersHtml = renderToString(
+    React.createElement(PapersPanel, {
+      papers: data.papers,
+      reviewers: data.reviewers,
+      preAssignments: data.preAssignments,
+      onChange: () => {},
+      onAddPreAssignment: () => {},
+      onRemovePreAssignment: () => {},
+      conflictCountOf: () => 0
+    })
+  )
+  if (!papersHtml.includes('预指派评审人')) throw new Error('预指派编辑区未渲染')
+  if (!papersHtml.includes('指定评审人')) throw new Error('预指派添加入口未渲染')
+  if (!papersHtml.includes('待处理的失效预指派关系')) throw new Error('失效关系提示区未渲染')
+  if (!papersHtml.includes('rev_deleted')) throw new Error('失效关系应保留被删除评审人 id')
+  if (!papersHtml.includes('移除该关系')) throw new Error('失效关系逐条移除按钮未渲染')
+  console.log('✓ 稿件面板（预指派编辑区 + 失效关系提示）渲染成功')
+
+  // 含失效预指派 → 生成失败，结果区必须列出具体稿件、评审人、原因，且无部分结果
+  const fail = solveAssignment(data)
+  if (fail.feasible) throw new Error('含失效预指派时不应生成结果')
+  const failHtml = renderToString(
+    React.createElement(ResultPanel, { data, result: fail, stale: false, onExport: () => {}, onApplySwap: () => {} })
+  )
+  if (!failHtml.includes('预指派硬约束无法满足')) throw new Error('预指派失败横幅未渲染')
+  if (!failHtml.includes('rev_deleted')) throw new Error('失败结果未列出失效评审人')
+  console.log('✓ 预指派失败结果（逐条原因、无部分结果）渲染成功')
+
+  // 移除失效关系后 → 成功，结果与导出标注来自预指派的分派
+  const okData: AppData = { ...data, preAssignments: data.preAssignments.filter((p) => p.id === 'pre_ok') }
+  const ok = solveAssignment(okData)
+  if (!ok.feasible) throw new Error('有效预指派数据应可生成结果')
+  if (ok.objective.preassignedCount !== 1) throw new Error('预指派计数应为 1')
+  if (!ok.assignments.some((a) => a.paperId === base.papers[0].id && a.reviewerId === 'rev_bob' && a.preassigned))
+    throw new Error('Bob 对第一篇的预指派未体现在结果中')
+  const okHtml = renderToString(
+    React.createElement(ResultPanel, { data: okData, result: ok, stale: false, onExport: () => {}, onApplySwap: () => {} })
+  )
+  if (!okHtml.includes('预指派')) throw new Error('成功结果未展示预指派标记')
+  const payload = buildExportPayload(okData, ok)
+  if (payload.summary.preassignedCount !== 1) throw new Error('导出 summary 缺少预指派计数')
+  if (!payload.assignments.some((a) => a.preassigned && a.reviewerId === 'rev_bob'))
+    throw new Error('导出未标注来自预指派的分派')
+  console.log('✓ 预指派成功结果与 JSON 导出标注渲染成功')
+}
+
+// 旧数据兼容：localStorage 中没有 preAssignments 字段时，应用仍可正常渲染与求解
+{
+  const legacy = { papers: createSampleData().papers, reviewers: createSampleData().reviewers }
+  store.set('blind-review-desk:data:v1', JSON.stringify(legacy))
+  const html = renderToString(React.createElement(App))
+  if (!html.includes('盲审分配台')) throw new Error('旧数据渲染异常')
+  const solved = solveAssignment(legacy as AppData)
+  if (!solved.feasible || solved.objective.preassignedCount !== 0) throw new Error('旧数据求解/预指派缺省值异常')
+  console.log('✓ 旧数据（无 preAssignments 字段）兼容正常')
 }

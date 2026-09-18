@@ -39,7 +39,11 @@ export function stressFingerprint(data: AppData, precomputed?: HardConstraintEva
         `${r.id}|${r.name}|${r.capacity}|${[...r.tags].sort().join(',')}|${[...r.conflictPaperIds].sort().join(',')}`
     )
     .sort()
-  return JSON.stringify({ papers, reviewers })
+  // 预指派也是硬约束：增删关系后压力测试报告同样立即过期
+  const preAssignments = hc.preAssignments
+    .map((pa) => `${pa.paperId}>${pa.reviewerId}`)
+    .sort()
+  return JSON.stringify({ papers, reviewers, preAssignments })
 }
 
 export type StressTestOutcome =
@@ -99,12 +103,13 @@ function simulateAbsence(
 ): StressScenario {
   const absent = reviewers[absentIndex]
 
-  // 不修改录入数据：构造容量置 0 的临时副本
+  // 不修改录入数据：构造容量置 0 的临时副本（预指派关系保持不变，仍是硬约束）
   const tempData: AppData = {
     papers: rawData.papers,
     reviewers: rawData.reviewers.map((r) =>
       r.id === absentId ? { ...r, capacity: 0 } : r
-    )
+    ),
+    preAssignments: rawData.preAssignments ?? []
   }
   const hc = evaluateHardConstraints(tempData)
   const remainingCapacity = hc.capacities.reduce((a, b) => a + b, 0)

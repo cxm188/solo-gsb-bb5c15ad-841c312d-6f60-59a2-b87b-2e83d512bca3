@@ -6,6 +6,8 @@
  * 交换后 A 改评 q、B 改评 p（其余分派不变）。
  *
  * 候选必须同时满足，缺一不可：
+ *  0. 被换走的两条分派都不是预指派：预指派是与冲突/容量/人数并列的硬约束，
+ *     任何互换都不得把预指派评审人从其指定稿件上换走；
  *  1. 非同稿、交换后组合确实改变：p ≠ q（同稿时 A、B 互相对调，二人仍评同一篇，
  *     组合毫无变化，也会让该稿出现重复评审人，直接排除）；
  *  2. 无利益冲突：A 未声明回避 q、B 未声明回避 p；
@@ -54,6 +56,8 @@ export interface SwapExclusionCounts {
   conflict: number
   /** 交换后某评审人会重复承担同一稿件 */
   duplicate: number
+  /** 被换走的分派中有预指派（硬约束不允许互换移除预指派） */
+  preassigned: number
 }
 
 export interface SwapEnumeration {
@@ -77,7 +81,7 @@ function papersOf(assignments: AssignmentItem[], reviewerId: string): Set<string
  * 要求两位评审人当前都至少承担一篇稿件，否则返回空列表。
  */
 export function enumerateSwaps(data: AppData, result: AssignmentSuccess, reviewerAId: string, reviewerBId: string): SwapEnumeration {
-  const excluded: SwapExclusionCounts = { samePaper: 0, conflict: 0, duplicate: 0 }
+  const excluded: SwapExclusionCounts = { samePaper: 0, conflict: 0, duplicate: 0, preassigned: 0 }
   if (!reviewerAId || !reviewerBId || reviewerAId === reviewerBId) {
     return { candidates: [], excluded }
   }
@@ -107,6 +111,12 @@ export function enumerateSwaps(data: AppData, result: AssignmentSuccess, reviewe
     const p = assA.paperId // A 现承担，交换后由 B 承担
     for (const assB of bPapers) {
       const q = assB.paperId // B 现承担，交换后由 A 承担
+
+      // 排除项 0：预指派分派不允许被互换换走（硬约束）
+      if (assA.preassigned || assB.preassigned) {
+        excluded.preassigned++
+        continue
+      }
 
       // 排除项 1：同稿 → 交换后组合不变（且该稿会出现重复评审人）
       if (p === q) {
@@ -212,6 +222,11 @@ export function applySwapCandidate(
   if (!has(sideA.fromPaperId, sideA.reviewerId)) return null
   if (!has(sideB.fromPaperId, sideB.reviewerId)) return null
 
+  // 预指派硬约束：被换走的分派不得是预指派（枚举阶段已排除，此处兜底防过期候选）
+  const fromA = result.assignments.find((a) => a.paperId === sideA.fromPaperId && a.reviewerId === sideA.reviewerId)
+  const fromB = result.assignments.find((a) => a.paperId === sideB.fromPaperId && a.reviewerId === sideB.reviewerId)
+  if (fromA?.preassigned || fromB?.preassigned) return null
+
   // 同稿 / 组合不变
   if (sideA.fromPaperId === sideB.fromPaperId) return null
   // 利益冲突：交换后 A 评 toPaper（= B 的 fromPaper），B 同理
@@ -263,7 +278,12 @@ export function applySwapCandidate(
       topicMatches,
       maxLoad: Math.max(0, ...loads.map((l) => l.assigned)),
       totalAssigned: next.length,
-      totalRequired: result.objective.totalRequired
+      totalRequired: result.objective.totalRequired,
+      // 互换不会触碰任何预指派条目，数量保持不变（来自旧结果，旧结果缺省时按条目重算）
+      preassignedCount:
+        typeof result.objective.preassignedCount === 'number'
+          ? result.objective.preassignedCount
+          : next.filter((a) => a.preassigned === true).length
     },
     manuallyAdjusted: true,
     swapCount: (result.swapCount ?? 0) + 1

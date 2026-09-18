@@ -50,6 +50,7 @@ export function SwapTool({ data, result, onApply }: SwapToolProps) {
         <p className="muted swap-desc">
           选择两位<strong>已有任务</strong>的评审人，枚举其任务之间所有一换一候选；
           自动排除同稿（交换后组合不变）、交换后触发利益冲突、让同一评审人重复承担同一稿件的项，
+          以及<strong>预指派</strong>分派（硬约束不允许互换换走），
           候选按主题匹配净增从高到低排列。确认后仅改派当前结果，录入数据不变。
         </p>
       </div>
@@ -120,10 +121,14 @@ export function SwapTool({ data, result, onApply }: SwapToolProps) {
           <div className="swap-summary">
             共枚举到 <strong>{enumeration.candidates.length}</strong> 个可行互换候选
             {enumeration.candidates.length === 0 && '——这两位评审人的现有任务之间没有可安全互换的组合'}
-            {(enumeration.excluded.samePaper + enumeration.excluded.conflict + enumeration.excluded.duplicate > 0) && (
+            {(enumeration.excluded.samePaper +
+              enumeration.excluded.conflict +
+              enumeration.excluded.duplicate +
+              enumeration.excluded.preassigned >
+              0) && (
               <span className="muted">
                 （已排除：同稿/组合不变 {enumeration.excluded.samePaper}，利益冲突 {enumeration.excluded.conflict}
-                ，重复承担 {enumeration.excluded.duplicate}）
+                ，重复承担 {enumeration.excluded.duplicate}，预指派 {enumeration.excluded.preassigned}）
               </span>
             )}
           </div>

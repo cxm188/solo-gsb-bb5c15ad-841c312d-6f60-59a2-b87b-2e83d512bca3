@@ -14,7 +14,16 @@ interface ResultPanelProps {
 const kindLabel: Record<string, string> = {
   'global-capacity': '全局容量不足',
   'paper-eligible': '单篇稿件可分配人数不足',
-  'subset-bottleneck': '组合性瓶颈（局部容量不足）'
+  'subset-bottleneck': '组合性瓶颈（局部容量不足）',
+  preassignment: '预指派硬约束无法满足'
+}
+
+const issueLabel: Record<string, string> = {
+  'paper-missing': '引用稿件不存在',
+  'reviewer-missing': '引用评审人不存在',
+  conflict: '与利益冲突冲突',
+  'paper-overflow': '同篇预指派超过名额',
+  'reviewer-overload': '单人预占超过容量'
 }
 
 export function ResultPanel({ data, result, stale, onExport, onApplySwap }: ResultPanelProps) {
@@ -24,7 +33,8 @@ export function ResultPanel({ data, result, stale, onExport, onApplySwap }: Resu
         <p>点击页面顶部的「▶ 生成分派」按钮，系统将在浏览器本地完成整数规划求解。</p>
         <ul>
           <li>
-            <strong>硬约束</strong>：利益冲突回避、评审人容量上限、每篇稿件所需评审人数，三者必须全部满足；
+            <strong>硬约束</strong>：预指派必须入选、利益冲突回避、评审人容量上限、每篇稿件所需评审人数，
+            四者必须全部满足；
           </li>
           <li>
             <strong>优化目标</strong>：先最大化主题标签匹配，再最小化评审人最大负载（负载均衡）。
@@ -35,20 +45,56 @@ export function ResultPanel({ data, result, stale, onExport, onApplySwap }: Resu
   }
 
   if (!result.feasible) {
+    const preReason = result.reasons.find((r) => r.kind === 'preassignment')
     return (
       <section>
         <div className="result-banner result-banner--fail">
           <h2>✕ 无法生成可行分配</h2>
-          <p>以下硬约束无法同时满足，请按提示调整数据后重新生成：</p>
+          <p>以下硬约束无法同时满足，请按提示调整数据后重新生成（不会生成任何部分结果）：</p>
         </div>
-        <div className="reason-list">
-          {result.reasons.map((r, i) => (
-            <div className="reason-card" key={i}>
-              <span className="reason-kind">{kindLabel[r.kind] ?? r.kind}</span>
-              <p className="reason-message">{r.message}</p>
+        {preReason?.issues && preReason.issues.length > 0 && (
+          <div className="reason-list">
+            <div className="reason-card preassignment-reason-card">
+              <span className="reason-kind">{kindLabel.preassignment}</span>
+              <p className="reason-message">{preReason.message}</p>
+              <div className="preassign-issue-table">
+                <div className="preassign-issue-row preassign-issue-head">
+                  <span>稿件</span>
+                  <span>评审人</span>
+                  <span>原因</span>
+                </div>
+                {preReason.issues.map((iss) => (
+                  <div className="preassign-issue-row" key={iss.preAssignmentId}>
+                    <span>{iss.paperTitle ? `《${iss.paperTitle}》` : `（已删除：${iss.paperId ?? '—'}）`}</span>
+                    <span>{iss.reviewerName ?? `（已删除：${iss.reviewerId ?? '—'}）`}</span>
+                    <span>
+                      <span className="stress-chip stress-chip--red">{issueLabel[iss.reason] ?? iss.reason}</span>
+                      <span className="muted preassign-issue-detail">{iss.message}</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
             </div>
-          ))}
-        </div>
+            {result.reasons
+              .filter((r) => r.kind !== 'preassignment')
+              .map((r, i) => (
+                <div className="reason-card" key={i}>
+                  <span className="reason-kind">{kindLabel[r.kind] ?? r.kind}</span>
+                  <p className="reason-message">{r.message}</p>
+                </div>
+              ))}
+          </div>
+        )}
+        {!preReason && (
+          <div className="reason-list">
+            {result.reasons.map((r, i) => (
+              <div className="reason-card" key={i}>
+                <span className="reason-kind">{kindLabel[r.kind] ?? r.kind}</span>
+                <p className="reason-message">{r.message}</p>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
     )
   }
@@ -61,7 +107,7 @@ export function ResultPanel({ data, result, stale, onExport, onApplySwap }: Resu
     byPaper.set(a.paperId, list)
   }
 
-  const { totalRequired, totalAssigned, topicMatches, maxLoad } = result.objective
+  const { totalRequired, totalAssigned, topicMatches, maxLoad, preassignedCount } = result.objective
 
   return (
     <section>
@@ -86,6 +132,10 @@ export function ResultPanel({ data, result, stale, onExport, onApplySwap }: Resu
           <div className="stat">
             <strong>{maxLoad}</strong>
             <span>评审人最大负载</span>
+          </div>
+          <div className="stat">
+            <strong className={preassignedCount > 0 ? 'stat-pre' : undefined}>{preassignedCount}</strong>
+            <span>来自预指派</span>
           </div>
         </div>
         <button className="btn btn-primary" onClick={onExport}>
@@ -129,6 +179,11 @@ export function ResultPanel({ data, result, stale, onExport, onApplySwap }: Resu
                     return (
                       <div className={`assignee ${a.topicMatched ? 'is-match' : 'is-nomatch'}`} key={a.reviewerId}>
                         <span className="assignee-name">{rv?.name ?? a.reviewerId}</span>
+                        {a.preassigned ? (
+                          <span className="badge badge-preassigned" title="该分派来自稿件编辑区的预指派（硬约束）">
+                            📌 预指派
+                          </span>
+                        ) : null}
                         {a.topicMatched ? (
                           <span className="badge badge-match">主题匹配</span>
                         ) : (
@@ -157,10 +212,14 @@ export function ResultPanel({ data, result, stale, onExport, onApplySwap }: Resu
         {result.loads.map((l) => {
           const rv = reviewerMap.get(l.reviewerId)
           const pct = l.capacity > 0 ? Math.round((l.assigned / l.capacity) * 100) : 0
+          const forcedCount = result.assignments.filter(
+            (a) => a.reviewerId === l.reviewerId && a.preassigned === true
+          ).length
           return (
             <div className="load-row" key={l.reviewerId}>
               <span className="load-name" title={rv?.name}>
                 {rv?.name ?? l.reviewerId}
+                {forcedCount > 0 && <em className="load-preassigned" title="其中来自预指派的名额">📌 {forcedCount}</em>}
               </span>
               <div className="load-bar">
                 <div
